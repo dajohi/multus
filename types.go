@@ -304,7 +304,7 @@ func NewMetadata(filepath string) (*Metadata, error) {
 		Mode: uint32(stat.Mode()),
 		UID:  statT.Uid,
 		GID:  statT.Gid,
-		RDev: uint64(statT.Rdev),
+		RDev: statT.Rdev,
 	}
 	MD := Metadata{
 		Attribs: fileAttributes,
