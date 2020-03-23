@@ -1,0 +1,17 @@
+backuppath: /home/user/backup/
+
+restore:
+  secretfile: "/home/user/.multus/user.secret"
+backup:
+  group: _multus
+  maxintervals: 0
+  paths:
+   - /etc
+   - /home
+   - /var
+  excludes:
+   - "^/usr/src/"
+   - "^/usr/obj/"
+   - "\\*.core$"
+   - "\\*.o$"
+  pubkeyfile: "/home/user/.multus/user.public"

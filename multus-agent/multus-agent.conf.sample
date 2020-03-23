@@ -1,0 +1,8 @@
+storagepath: /home/user/storage
+maxsize: 1073741824
+bwlimit: 1.5m
+login: _multus
+
+hosts:
+  - hostname: "server1.example.com"
+    backuppath: "/home/_multus/backup/"
