@@ -25,20 +25,6 @@ func usage() {
 }
 
 func main() {
-	go func() {
-		listenAddr := "localhost:45454"
-		log.Printf("Creating profiling server "+
-			"listening on %s", listenAddr)
-		profileRedirect := http.RedirectHandler("/debug/pprof",
-			http.StatusSeeOther)
-		http.Handle("/", profileRedirect)
-		err := http.ListenAndServe(listenAddr, nil)
-		if err != nil {
-			log.Printf("%v", err)
-			os.Exit(1)
-		}
-	}()
-
 	cfg, err := loadConfig()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -47,6 +33,21 @@ func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
+	}
+	if cfg.Profile {
+		go func() {
+			listenAddr := "localhost:45454"
+			log.Printf("Creating profiling server "+
+				"listening on %s", listenAddr)
+			profileRedirect := http.RedirectHandler("/debug/pprof",
+				http.StatusSeeOther)
+			http.Handle("/", profileRedirect)
+			err := http.ListenAndServe(listenAddr, nil)
+			if err != nil {
+				log.Printf("%v", err)
+				os.Exit(1)
+			}
+		}()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

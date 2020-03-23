@@ -3,6 +3,7 @@ package main
 import (
 	"compress/gzip"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"regexp"
 
@@ -28,12 +29,16 @@ type RestoreConfig struct {
 }
 
 type config struct {
+	Profile    bool
 	BackupPath string
 	Backup     BackupConfig
 	Restore    RestoreConfig
 }
 
 func loadConfig() (*config, error) {
+	if err := os.MkdirAll(defaultHomeDir, 0700); err != nil {
+		return nil, err
+	}
 	configPath := filepath.Join(defaultHomeDir, "multus.conf")
 	configFile, err := ioutil.ReadFile(configPath)
 	if err != nil {
