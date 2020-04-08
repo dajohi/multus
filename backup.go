@@ -51,14 +51,22 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 	}
 
 	sigFile := filepath.Join(destDir, "sig.cache")
-	sc, err := LoadSignatureCache(sigFile, cfg.Backup.MaxIntervals)
+	existingSC, err := LoadSignatureCache(sigFile)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	var sc *SignatureCache
+	if existingSC == nil || existingSC.Instance()+1 > cfg.Backup.MaxIntervals {
+		sc, err = NewSignatureCache(filepath.Join(destDir, "sig.cache.inprogress"), time.Now(), 0)
+	} else {
+		sc, err = NewSignatureCache(filepath.Join(destDir, "sig.cache.inprogress"), existingSC.timeStamp, existingSC.Instance()+1)
+	}
 	if err != nil {
 		return err
 	}
-	if sc.Len() != 0 {
-		sc.instance++
-	}
-	pathsToCheck := sc.Paths()
+
+	pathsToCheck := existingSC.Paths()
 
 	log.Printf("----------  RUNNING LEVEL %d (%v) -----------", sc.instance, sc.timeStamp)
 
@@ -110,7 +118,10 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 			}
 
 			fileMode := os.FileMode(MD.Attribs.Mode)
-			currentSig := sc.Get(srcPath)
+			currentSig, err := existingSC.Get(srcPath)
+			if err != nil {
+				return err
+			}
 
 			switch {
 			case isSocket(fileMode):
@@ -140,6 +151,7 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 					sc.Add(srcPath, thisSig)
 				} else {
 					log.Printf("%q no change", srcPath)
+					sc.Add(srcPath, currentSig)
 				}
 				delete(pathsToCheck, srcPath)
 				return nil
@@ -173,6 +185,7 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 					sc.Add(srcPath, thisSig)
 				} else {
 					log.Printf("%q: no change", srcPath)
+					sc.Add(srcPath, currentSig)
 				}
 				delete(pathsToCheck, srcPath)
 				return nil
@@ -215,6 +228,7 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 					sc.Add(srcPath, thisSig)
 				} else {
 					log.Printf("%q: no change", srcPath)
+					sc.Add(srcPath, currentSig)
 				}
 				srcFD.Close()
 				delete(pathsToCheck, srcPath)
@@ -231,7 +245,6 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 	// handle deleted files
 	for deletedFilePath := range pathsToCheck {
 		log.Printf("%q: deleted", deletedFilePath)
-		sc.Delete(deletedFilePath)
 		_, err = snap.Add(&Metadata{Path: deletedFilePath, Attribs: FileAttributes{}}, nil, 0)
 		if err != nil {
 			snap.Close()
@@ -245,15 +258,13 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 		return err
 	}
 
-	sigFD, err := os.OpenFile(sigFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o0640)
-	if err != nil {
+	if err = sc.Close(); err != nil {
 		return err
 	}
-	if err = sc.Write(sigFD); err != nil {
-		sigFD.Close()
+	if err = existingSC.Close(); err != nil {
 		return err
 	}
-	if err = sigFD.Close(); err != nil {
+	if err = os.Rename(sc.fd.Name(), sigFile); err != nil {
 		return err
 	}
 	err = os.Chown(sigFile, uid, gid)

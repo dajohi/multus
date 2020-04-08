@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -75,31 +74,65 @@ func NewSignatureEntry(path string, signature Signature) *SignatureEntry {
 }
 
 type SignatureCache struct {
-	version    uint16
-	instance   uint16
-	hostname   string
-	timeStamp  time.Time
-	signatures map[string]Signature
+	version       uint16
+	instance      uint16
+	hostname      string
+	timeStamp     time.Time
+	signatures    map[string]*SigLocator
+	fd            *os.File
+	wOffset       int64
+	numSigs       uint64
+	numSigsOffset int64
+	write         bool
 }
 
-func (sc *SignatureCache) Paths() map[string]struct{} {
-	paths := make(map[string]struct{}, len(sc.signatures))
-	for path := range sc.signatures {
-		paths[path] = struct{}{}
+func (sc *SignatureCache) Paths() map[string]*SigLocator {
+	if sc == nil {
+		return make(map[string]*SigLocator)
 	}
-	return paths
+	return sc.signatures 
 }
 
-func (sc *SignatureCache) Add(path string, signature Signature) {
-	sc.signatures[path] = signature
+func (sc *SignatureCache) Add(path string, signature Signature) error {
+	entry := NewSignatureEntry(path, signature).Serialize()
+	numBytes, err := sc.fd.WriteAt(entry, sc.wOffset)
+	sc.wOffset += int64(numBytes)
+	if err != nil {
+		return err
+	}
+	sc.numSigs++
+	return nil
 }
 
-func (sc *SignatureCache) Delete(path string) {
-	delete(sc.signatures, path)
+func (sc *SignatureCache) Close() error {
+	if sc == nil {
+		return nil
+	}
+	if sc.write {
+		// write numSigs before close
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf[0:8], sc.numSigs)
+		if _, err := sc.fd.WriteAt(buf, sc.numSigsOffset); err != nil {
+			return err
+		}
+	}
+	return sc.fd.Close()
 }
 
-func (sc *SignatureCache) Get(path string) Signature {
-	return sc.signatures[path]
+func (sc *SignatureCache) Get(path string) (Signature, error) {
+	if sc == nil {
+		return nil, nil
+	}
+	locator, exists := sc.signatures[path]
+	if !exists {
+		return nil, nil
+	}
+	buf := make([]byte, locator.sigLen)
+	_, err := sc.fd.ReadAt(buf, locator.sigOffset)
+	if err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 func (sc *SignatureCache) Instance() uint16 {
@@ -110,92 +143,143 @@ func (sc *SignatureCache) Len() int {
 	return len(sc.signatures)
 }
 
-func (sc *SignatureCache) Write(fd io.Writer) error {
-	buf := make([]byte, 2+2+1+len(sc.hostname)+8+8)
-
-	offset := 0
-	binary.LittleEndian.PutUint16(buf[offset:offset+2], sc.version)
-	offset += 2
-	binary.LittleEndian.PutUint16(buf[offset:offset+2], sc.instance)
-	offset += 2
-	buf[offset] = byte(len(sc.hostname))
-	offset++
-	copy(buf[offset:offset+len(sc.hostname)], []byte(sc.hostname))
-	offset += len(sc.hostname)
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], uint64(sc.timeStamp.Unix()))
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], uint64(len(sc.signatures)))
-
-	if _, err := fd.Write(buf); err != nil {
-		return err
-	}
-	for path, sig := range sc.signatures {
-		if _, err := fd.Write(NewSignatureEntry(path, sig).Serialize()); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func LoadSignatureCache(sigfile string, maxIntervals uint16) (*SignatureCache, error) {
+func NewSignatureCache(sigFile string, timeStamp time.Time, instance uint16) (*SignatureCache, error) {
 	hostname, err := os.Hostname()
 	if err != nil {
 		return nil, err
 	}
-	SC := SignatureCache{
-		signatures: make(map[string]Signature, 204800),
-		version:    FormatVersion,
-	}
-	buf, err := ioutil.ReadFile(sigfile)
+	fd, err := os.OpenFile(sigFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0640)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			SC.hostname = hostname
-			SC.timeStamp = time.Now()
-			return &SC, nil
-		}
 		return nil, err
 	}
-	if len(buf) < 14 {
-		SC.hostname = hostname
-		SC.timeStamp = time.Now()
-		return &SC, nil
+
+	buf := make([]byte, 2+2+1+len(hostname)+8+8)
+	offset := 0
+	binary.LittleEndian.PutUint16(buf[offset:offset+2], FormatVersion)
+	offset += 2
+	binary.LittleEndian.PutUint16(buf[offset:offset+2], instance)
+	offset += 2
+	buf[offset] = byte(len(hostname))
+	offset++
+	copy(buf[offset:offset+len(hostname)], []byte(hostname))
+	offset += len(hostname)
+	binary.LittleEndian.PutUint64(buf[offset:offset+8], uint64(timeStamp.Unix()))
+	offset += 8
+	// 0 sigs
+	binary.LittleEndian.PutUint64(buf[offset:offset+8], 0)
+	offset += 8
+
+	if _, err := fd.Write(buf); err != nil {
+		return nil, err
 	}
 
-	offset := 0
-	SC.version = binary.LittleEndian.Uint16(buf[offset : offset+2])
-	offset += 2
-	SC.instance = binary.LittleEndian.Uint16(buf[offset : offset+2])
-	if SC.instance+1 > maxIntervals {
-		SC.version = FormatVersion
-		SC.instance = 0
-		SC.hostname = hostname
-		SC.timeStamp = time.Now()
-		return &SC, nil
+	return &SignatureCache{
+		fd:            fd,
+		numSigsOffset: 2 + 2 + 1 + int64(len(hostname)) + 8,
+		wOffset:       int64(offset),
+		timeStamp:     timeStamp,
+		hostname:      hostname,
+		instance:      instance,
+		write:         true,
+	}, nil
+}
+
+type SigLocator struct {
+	sigOffset int64
+	sigLen    int64
+}
+
+func LoadSignatureCache(sigfile string) (*SignatureCache, error) {
+	fd, err := os.Open(sigfile)
+	if err != nil {
+		return nil, err
 	}
+	bufW := new(bytes.Buffer)
+	_, err = io.CopyN(bufW, fd, 5)
+	if err != nil {
+		fd.Close()
+		return nil, err
+	}
+	buf := bufW.Bytes()
+	bufW.Reset()
+
+	var goffset int64
+	var offset int
+	version := binary.LittleEndian.Uint16(buf[offset : offset+2])
+	offset += 2
+	instance := binary.LittleEndian.Uint16(buf[offset : offset+2])
 	offset += 2
 	hostLen := int(buf[offset])
+	_, err = io.CopyN(bufW, fd, int64(hostLen)+8+8)
+	if err != nil {
+		fd.Close()
+		return nil, err
+	}
 	offset++
-	SC.hostname = string(buf[offset : offset+hostLen])
+	goffset = int64(offset)
+	buf = bufW.Bytes()
+	bufW.Reset()
+
+	offset = 0
+	hostname := string(buf[offset : offset+hostLen])
 	offset += hostLen
-	SC.timeStamp = time.Unix(int64(binary.LittleEndian.Uint64(buf[offset:offset+8])), 0)
+	timeStamp := time.Unix(int64(binary.LittleEndian.Uint64(buf[offset:offset+8])), 0)
 	offset += 8
 	numSigs := binary.LittleEndian.Uint64(buf[offset : offset+8])
 	offset += 8
-	log.Printf("instance:%d numSigs:%d", SC.instance, numSigs)
+	log.Printf("instance:%d numSigs:%d", instance, numSigs)
+	goffset += int64(offset)
+
+	signatures := make(map[string]*SigLocator, numSigs)
+	locators := make([]SigLocator, numSigs)
 	for i := 0; i < int(numSigs); i++ {
+		_, err = io.CopyN(bufW, fd, 2)
+		if err != nil {
+			fd.Close()
+			return nil, err
+		}
+		goffset += 2
+		buf = bufW.Bytes()
+		bufW.Reset()
+
+		offset := 0
 		pathLen := binary.LittleEndian.Uint16(buf[offset : offset+2])
-		offset += 2
+
+		_, err = io.CopyN(bufW, fd, int64(pathLen)+8)
+		if err != nil {
+			fd.Close()
+			return nil, err
+		}
+		goffset += int64(pathLen) + 8
+		buf = bufW.Bytes()
+		bufW.Reset()
+
+		offset = 0
 		path := string(buf[offset : offset+int(pathLen)])
 		offset += int(pathLen)
 		sigLen := binary.LittleEndian.Uint64(buf[offset : offset+8])
 		offset += 8
-		signature := make([]byte, sigLen)
-		copy(signature, buf[offset:offset+int(sigLen)])
-		offset += int(sigLen)
 
-		SC.Add(path, signature)
+		locators[i].sigOffset = goffset
+		locators[i].sigLen = int64(sigLen)
+
+		goffset, err = fd.Seek(int64(sigLen), 1)
+		if err != nil {
+			fd.Close()
+			return nil, err
+		}
+		signatures[path] = &locators[i]
 	}
-	return &SC, nil
+	sc := &SignatureCache{
+		version:    version,
+		hostname:   hostname,
+		timeStamp:  timeStamp,
+		signatures: signatures,
+		numSigs:    numSigs,
+		instance:   instance,
+		fd:         fd,
+	}
+	return sc, nil
 }
 
 type FileAttributes struct {
