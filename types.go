@@ -17,19 +17,8 @@ import (
 	"time"
 
 	"github.com/jrick/ss/stream"
-	"github.com/silvasur/golibrsync/librsync"
+	"github.com/smtc/rsync"
 	"golang.org/x/sync/errgroup"
-)
-
-var (
-	emptyFileAttributes = []byte{
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00,
-	}
 )
 
 type Signature []byte
@@ -40,10 +29,6 @@ func (s Signature) IsEmpty() bool {
 
 func (s Signature) IsEqual(sig Signature) bool {
 	return bytes.Equal(s, sig)
-}
-
-func (s Signature) NewReader() *bytes.Reader {
-	return bytes.NewReader(s)
 }
 
 type SignatureEntry struct {
@@ -78,7 +63,7 @@ type SignatureCache struct {
 	instance      uint16
 	hostname      string
 	timeStamp     time.Time
-	signatures    map[string]*SigLocator
+	signatures    map[string]SigLocator
 	fd            *os.File
 	wOffset       int64
 	numSigs       uint64
@@ -86,11 +71,11 @@ type SignatureCache struct {
 	write         bool
 }
 
-func (sc *SignatureCache) Paths() map[string]*SigLocator {
+func (sc *SignatureCache) Paths() map[string]SigLocator {
 	if sc == nil {
-		return make(map[string]*SigLocator)
+		return make(map[string]SigLocator)
 	}
-	return sc.signatures 
+	return sc.signatures
 }
 
 func (sc *SignatureCache) Add(path string, signature Signature) error {
@@ -119,20 +104,21 @@ func (sc *SignatureCache) Close() error {
 	return sc.fd.Close()
 }
 
-func (sc *SignatureCache) Get(path string) (Signature, error) {
+func (sc *SignatureCache) Get(dstBuf *bytes.Buffer, path string) error {
 	if sc == nil {
-		return nil, nil
+		return nil
 	}
 	locator, exists := sc.signatures[path]
 	if !exists {
-		return nil, nil
+		return nil
 	}
 	buf := make([]byte, locator.sigLen)
 	_, err := sc.fd.ReadAt(buf, locator.sigOffset)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return buf, nil
+	_, err = dstBuf.Write(buf)
+	return err
 }
 
 func (sc *SignatureCache) Instance() uint16 {
@@ -195,6 +181,7 @@ func LoadSignatureCache(sigfile string) (*SignatureCache, error) {
 		return nil, err
 	}
 	bufW := new(bytes.Buffer)
+	bufW.Grow(4 + 255 + 8 + 8)
 	_, err = io.CopyN(bufW, fd, 5)
 	if err != nil {
 		fd.Close()
@@ -227,11 +214,10 @@ func LoadSignatureCache(sigfile string) (*SignatureCache, error) {
 	offset += 8
 	numSigs := binary.LittleEndian.Uint64(buf[offset : offset+8])
 	offset += 8
-	log.Printf("instance:%d numSigs:%d", instance, numSigs)
 	goffset += int64(offset)
 
-	signatures := make(map[string]*SigLocator, numSigs)
-	locators := make([]SigLocator, numSigs)
+	var l SigLocator
+	signatures := make(map[string]SigLocator, numSigs)
 	for i := 0; i < int(numSigs); i++ {
 		_, err = io.CopyN(bufW, fd, 2)
 		if err != nil {
@@ -260,15 +246,17 @@ func LoadSignatureCache(sigfile string) (*SignatureCache, error) {
 		sigLen := binary.LittleEndian.Uint64(buf[offset : offset+8])
 		offset += 8
 
-		locators[i].sigOffset = goffset
-		locators[i].sigLen = int64(sigLen)
+		l = SigLocator{
+			sigOffset: goffset,
+			sigLen:    int64(sigLen),
+		}
 
 		goffset, err = fd.Seek(int64(sigLen), 1)
 		if err != nil {
 			fd.Close()
 			return nil, err
 		}
-		signatures[path] = &locators[i]
+		signatures[path] = l
 	}
 	sc := &SignatureCache{
 		version:    version,
@@ -292,7 +280,8 @@ type FileAttributes struct {
 }
 
 func (f FileAttributes) IsEmpty() bool {
-	return bytes.Equal(f.Serialize(), emptyFileAttributes)
+	return f.Size == 0 && f.MTim == 0 && f.RDev == 0 &&
+		f.Mode == 0 && f.UID == 0 && f.GID == 0
 }
 
 func (f *FileAttributes) Deserialize(buf []byte) error {
@@ -310,7 +299,7 @@ func (f *FileAttributes) Deserialize(buf []byte) error {
 	return nil
 }
 
-func (f FileAttributes) Serialize() []byte {
+func (f FileAttributes) Serialize(dstBuf *bytes.Buffer) error {
 	var buf [36]byte
 	binary.LittleEndian.PutUint64(buf[0:8], uint64(f.Size))
 	binary.LittleEndian.PutUint64(buf[8:16], uint64(f.MTim))
@@ -319,30 +308,22 @@ func (f FileAttributes) Serialize() []byte {
 	binary.LittleEndian.PutUint32(buf[28:32], f.UID)
 	binary.LittleEndian.PutUint32(buf[32:36], f.GID)
 
-	return buf[:]
+	_, err := dstBuf.Write(buf[:])
+	return err
 }
 
 var (
 	fSig = new(bytes.Buffer)
+	gSig = new(bytes.Reader)
 )
 
-func init() {
-	fSig.Grow(48)
-}
-
-func (f FileAttributes) Signature() ([]byte, error) {
-	fbuf := f.Serialize()
-
-	bufReader := bytes.NewReader(fbuf)
+func (f FileAttributes) Signature(dstBuf *bytes.Buffer) error {
 	fSig.Reset()
-	err := librsync.CreateSignature(bufReader, fSig)
-	if err != nil {
-		return nil, err
+	if err := f.Serialize(fSig); err != nil {
+		return err
 	}
-	buf := make([]byte, fSig.Len())
-	copy(buf, fSig.Bytes())
 
-	return buf, nil
+	return rsync.GenSign(fSig, int64(fSig.Len()), 2048, dstBuf)
 }
 
 type Metadata struct {
@@ -354,7 +335,7 @@ func (m *Metadata) DataLen() int64 {
 	return m.Attribs.Size
 }
 
-func (m *Metadata) Serialize() []byte {
+func (m *Metadata) Serialize(dstBuf *bytes.Buffer) error {
 	var offset int
 	pathLen := len(m.Path)
 	buf := make([]byte, 2+pathLen+36)
@@ -363,13 +344,15 @@ func (m *Metadata) Serialize() []byte {
 	offset += 2
 	copy(buf[offset:offset+pathLen], m.Path)
 	offset += pathLen
-	copy(buf[offset:], m.Attribs.Serialize())
 
-	return buf
+	if _, err := dstBuf.Write(buf[0:offset]); err != nil {
+		return err
+	}
+	return m.Attribs.Serialize(dstBuf)
 }
 
-func (m *Metadata) Signature() (Signature, error) {
-	return m.Attribs.Signature()
+func (m *Metadata) Signature(dstBuf *bytes.Buffer) error {
+	return m.Attribs.Signature(dstBuf)
 }
 
 func NewMetadata(filepath string) (*Metadata, error) {
@@ -408,45 +391,49 @@ type Snapshot struct {
 	eg           *errgroup.Group
 	bytesWritten int64
 	err          error
+	readBuffer   *bytes.Reader
+	writeBuffer  *bytes.Buffer
 }
 
-func GenSignature(md *Metadata, dataReader io.ReadSeeker) (Signature, error) {
-	attribSig, err := md.Signature()
+func GenSignature(dstBuf *bytes.Buffer, md *Metadata, dataReader io.ReadSeeker, len int64) error {
+	err := md.Signature(dstBuf)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if dataReader != nil {
-		dataSignature, err := signatureFromReader(dataReader)
+		err := signatureFromReader(dstBuf, dataReader, len)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		// signature of both attribs and data
-		si := append(attribSig, dataSignature...)
-		finalSig, err := signatureFromReader(bytes.NewReader(si))
+		gSig.Reset(dstBuf.Bytes())
+		dstBuf.Reset()
+		err = signatureFromReader(dstBuf, gSig, len)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		return finalSig, nil
+		return nil
 	}
-	return attribSig, nil
+	return nil
 }
 
-func (s *Snapshot) Add(md *Metadata, dataReader io.ReadSeeker, dataLen int64) (Signature, error) {
+func (s *Snapshot) Add(md *Metadata, dataReader io.ReadSeeker, dataLen int64) error {
 	if s.err != nil {
-		return nil, s.err
+		return s.err
 	}
-	numBytes, err := s.gz.Write(md.Serialize())
+	s.writeBuffer.Reset()
+	if err := md.Serialize(s.writeBuffer); err != nil {
+		s.err = err
+		return err
+	}
+
+	numBytes, err := s.gz.Write(s.writeBuffer.Bytes())
 	s.bytesWritten += int64(numBytes)
 	if err != nil {
 		s.err = err
-		return nil, err
-	}
-	attribSig, err := md.Signature()
-	if err != nil {
-		s.err = err
-		return nil, err
+		return err
 	}
 
 	var dataLenBytes [8]byte
@@ -455,39 +442,23 @@ func (s *Snapshot) Add(md *Metadata, dataReader io.ReadSeeker, dataLen int64) (S
 	s.bytesWritten += int64(numBytes)
 	if err != nil {
 		s.err = err
-		return nil, err
+		return err
 	}
 
 	if dataReader != nil {
-		dataSignature, err := signatureFromReader(dataReader)
-		if err != nil {
-			s.err = err
-			return nil, err
-		}
-
-		// signature of both attribs and data
-		si := append(attribSig, dataSignature...)
-		finalSig, err := signatureFromReader(bytes.NewReader(si))
-		if err != nil {
-			s.err = err
-			return nil, err
-		}
-
 		numBytes, err := io.CopyN(s.gz, dataReader, dataLen)
 		s.bytesWritten += numBytes
 		if err != nil {
 			s.err = err
-			return nil, err
+			return err
 		}
 
 		if numBytes != dataLen {
 			log.Printf("WARN: %q changed size during write: %d != %d",
 				md.Path, dataLen, numBytes)
 		}
-
-		return finalSig, nil
 	}
-	return attribSig, nil
+	return nil
 }
 
 func (s *Snapshot) Close() error {
@@ -541,7 +512,7 @@ func (s *Snapshot) BytesWritten() int64 {
 }
 
 // SnapshotList returns a sorted list of files based on increment version.
-func SnapshotList(secretKey *stream.SecretKey, dir string) (IncrementalFiles, error) {
+func SnapshotList(ctx context.Context, secretKey *stream.SecretKey, dir string) (IncrementalFiles, error) {
 	// Look for existing instances
 	instanceFiles, err := ioutil.ReadDir(dir)
 	if err != nil {
@@ -571,7 +542,7 @@ func SnapshotList(secretKey *stream.SecretKey, dir string) (IncrementalFiles, er
 		}
 
 		pipeR, pipeW := io.Pipe()
-		eg, _ := errgroup.WithContext(context.Background())
+		eg, _ := errgroup.WithContext(ctx)
 		eg.Go(func() error {
 			gzR, err := gzip.NewReader(pipeR)
 			if err != nil {
@@ -660,7 +631,7 @@ func (i IncrementalFiles) Swap(a, b int) {
 	i[a], i[b] = i[b], i[a]
 }
 
-func NewSnapshot(pubKey *stream.PublicKey, uid, gid, gzLevel int, dataDir, hostname string,
+func NewSnapshot(ctx context.Context, pubKey *stream.PublicKey, uid, gid, gzLevel int, dataDir, hostname string,
 	timeStamp time.Time, instance uint16, version uint16) (*Snapshot, error) {
 
 	header, symKey, err := stream.Encapsulate(rand.Reader, pubKey)
@@ -676,7 +647,7 @@ func NewSnapshot(pubKey *stream.PublicKey, uid, gid, gzLevel int, dataDir, hostn
 	}
 
 	pipeR, pipeW := io.Pipe()
-	eg, _ := errgroup.WithContext(context.Background())
+	eg, _ := errgroup.WithContext(ctx)
 	eg.Go(func() error {
 		return stream.Encrypt(fd, pipeR, header, symKey)
 	})
@@ -723,5 +694,7 @@ func NewSnapshot(pubKey *stream.PublicKey, uid, gid, gzLevel int, dataDir, hostn
 		pipeR:        pipeR,
 		eg:           eg,
 		bytesWritten: int64(numBytes),
+		readBuffer:   new(bytes.Reader),
+		writeBuffer:  new(bytes.Buffer),
 	}, nil
 }

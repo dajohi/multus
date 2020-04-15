@@ -4,16 +4,22 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jrick/ss/stream"
-	"github.com/silvasur/golibrsync/librsync"
+	"github.com/smtc/rsync"
+)
+
+const (
+	memoryLimit = 1024 * 1024 * 10
 )
 
 func lookupGroup(groupName string) (int, error) {
@@ -26,6 +32,25 @@ func lookupGroup(groupName string) (int, error) {
 		return -1, err
 	}
 	return int(gid), nil
+}
+
+func removeOld(snapName string) {
+	log.Printf("snapName: %s", snapName)
+	baseDir := filepath.Dir(snapName)
+
+	files, err := ioutil.ReadDir(baseDir)
+	if err != nil {
+		panic(err)
+	}
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), ".gz.enc") {
+			continue
+		}
+		if strings.HasPrefix(file.Name(), filepath.Base(snapName)[0:13]) {
+			continue
+		}
+		log.Printf("possible delete: %s", file.Name())
+	}
 }
 
 func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
@@ -58,6 +83,7 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 
 	var sc *SignatureCache
 	if existingSC == nil || existingSC.Instance()+1 > cfg.Backup.MaxIntervals {
+		existingSC = nil
 		sc, err = NewSignatureCache(filepath.Join(destDir, "sig.cache.inprogress"), time.Now(), 0)
 	} else {
 		sc, err = NewSignatureCache(filepath.Join(destDir, "sig.cache.inprogress"), existingSC.timeStamp, existingSC.Instance()+1)
@@ -70,22 +96,37 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 
 	log.Printf("----------  RUNNING LEVEL %d (%v) -----------", sc.instance, sc.timeStamp)
 
-	snap, err := NewSnapshot(pubKey, uid, gid, cfg.Backup.GZLevel, destDir, sc.hostname, sc.timeStamp, sc.instance, sc.version)
+	snap, err := NewSnapshot(ctx, pubKey, uid, gid, cfg.Backup.GZLevel, destDir, sc.hostname, sc.timeStamp, sc.instance, sc.version)
 	if err != nil {
 		return err
 	}
 
+	removeOld(snap.Name())
+
+	readBuffer := new(bytes.Reader)
+	currentSig := new(bytes.Buffer)
+	thisSig := new(bytes.Buffer)
 	delta := new(bytes.Buffer)
-	delta.Grow(1024 * 1024 * 10)
 
 	startTime := time.Now()
 	filesExcluded := int32(0)
+
+	var srcFD *os.File
 	for _, sourceDir := range cfg.Backup.Paths {
 		err = filepath.Walk(sourceDir, func(srcRelPath string, info os.FileInfo, err error) error {
-			if delta.Cap() > 1024*1024*10 {
+			if delta.Cap() > memoryLimit {
 				delta = new(bytes.Buffer)
-				delta.Grow(1024 * 1024 * 10)
+				debug.FreeOSMemory()
 			}
+			if thisSig.Cap() > memoryLimit {
+				thisSig = new(bytes.Buffer)
+				debug.FreeOSMemory()
+			}
+			if currentSig.Cap() > memoryLimit {
+				currentSig = new(bytes.Buffer)
+				debug.FreeOSMemory()
+			}
+
 			if err != nil {
 				log.Printf("Walk: %v", err)
 				return nil
@@ -117,12 +158,14 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 				return err
 			}
 
-			fileMode := os.FileMode(MD.Attribs.Mode)
-			currentSig, err := existingSC.Get(srcPath)
+			currentSig.Reset()
+			err = existingSC.Get(currentSig, srcPath)
 			if err != nil {
 				return err
 			}
 
+			thisSig.Reset()
+			fileMode := os.FileMode(MD.Attribs.Mode)
 			switch {
 			case isSocket(fileMode):
 				log.Printf("skipping socket file: %v", srcPath)
@@ -134,24 +177,30 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 			case isNamedPipe(fileMode):
 				fallthrough
 			case isDir(fileMode):
-				thisSig, err := GenSignature(MD, nil)
+				err = GenSignature(thisSig, MD, nil, 0)
 				if err != nil {
 					return err
 				}
-				if !bytes.Equal(currentSig, thisSig) {
-					if !currentSig.IsEmpty() {
+				if !bytes.Equal(currentSig.Bytes(), thisSig.Bytes()) {
+					if currentSig.Len() != 0 {
 						log.Printf("%q changed", srcPath)
 					} else {
 						log.Printf("%q new file", srcPath)
 					}
-					thisSig, err = snap.Add(MD, nil, 0)
+					err = snap.Add(MD, nil, 0)
 					if err != nil {
 						return err
 					}
-					sc.Add(srcPath, thisSig)
+					err = sc.Add(srcPath, thisSig.Bytes())
+					if err != nil {
+						return err
+					}
 				} else {
 					log.Printf("%q no change", srcPath)
-					sc.Add(srcPath, currentSig)
+					err = sc.Add(srcPath, currentSig.Bytes())
+					if err != nil {
+						return err
+					}
 				}
 				delete(pathsToCheck, srcPath)
 				return nil
@@ -161,16 +210,17 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 					return err
 				}
 				dataReader := bytes.NewReader([]byte(dest))
-				thisSig, err := GenSignature(MD, dataReader)
+				err = GenSignature(thisSig, MD, dataReader, int64(dataReader.Len()))
 				if err != nil {
 					return err
 				}
-				if !bytes.Equal(currentSig, thisSig) {
-					if !currentSig.IsEmpty() {
+				if !bytes.Equal(currentSig.Bytes(), thisSig.Bytes()) {
+					if currentSig.Len() != 0 {
 						log.Printf("%q changed", srcPath)
 
 						delta.Reset()
-						err = librsync.CreateDelta(currentSig.NewReader(), dataReader, delta)
+						readBuffer.Reset(currentSig.Bytes())
+						err = rsync.GenDelta(readBuffer, dataReader, int64(dataReader.Len()), delta)
 						if err != nil {
 							return err
 						}
@@ -178,46 +228,58 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 					} else {
 						log.Printf("%q new file", srcPath)
 					}
-					thisSig, err = snap.Add(MD, dataReader, int64(dataReader.Len()))
+					err = snap.Add(MD, dataReader, int64(dataReader.Len()))
 					if err != nil {
 						return err
 					}
-					sc.Add(srcPath, thisSig)
+					err = sc.Add(srcPath, thisSig.Bytes())
+					if err != nil {
+						return err
+					}
 				} else {
 					log.Printf("%q: no change", srcPath)
-					sc.Add(srcPath, currentSig)
+					err = sc.Add(srcPath, currentSig.Bytes())
+					if err != nil {
+						return err
+					}
 				}
 				delete(pathsToCheck, srcPath)
 				return nil
 			default:
-				srcFD, err := os.Open(srcPath)
+				srcFD, err = os.Open(srcPath)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Open: %v\n", err)
 					return nil
 				}
-				thisSig, err := GenSignature(MD, srcFD)
+				err = GenSignature(thisSig, MD, srcFD, info.Size())
 				if err != nil {
 					srcFD.Close()
 					return err
 				}
-				if !bytes.Equal(currentSig, thisSig) {
-					if !currentSig.IsEmpty() {
+				if !bytes.Equal(currentSig.Bytes(), thisSig.Bytes()) {
+					if currentSig.Len() != 0 {
 						log.Printf("%q: changed", srcPath)
 						delta.Reset()
-						err = librsync.CreateDelta(currentSig.NewReader(), srcFD, delta)
+						readBuffer.Reset(currentSig.Bytes())
+						err = rsync.GenDelta(readBuffer, srcFD, info.Size(), delta)
 						if err != nil {
+							srcFD.Close()
 							return err
 						}
-						thisSig, err = snap.Add(MD, bytes.NewReader(delta.Bytes()),
-							int64(len(delta.Bytes())))
+						readBuffer.Reset(delta.Bytes())
+
+						err = snap.Add(MD, readBuffer, int64(readBuffer.Len()))
+						readBuffer.Reset(nil)
 					} else {
 						log.Printf("%q new file", srcPath)
 						st, err := srcFD.Stat()
 						if err != nil {
+							srcFD.Close()
 							return err
 						}
-						thisSig, err = snap.Add(MD, srcFD, st.Size())
+						err = snap.Add(MD, srcFD, st.Size())
 						if err != nil {
+							srcFD.Close()
 							return err
 						}
 					}
@@ -225,10 +287,18 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 						srcFD.Close()
 						return err
 					}
-					sc.Add(srcPath, thisSig)
+					err = sc.Add(srcPath, thisSig.Bytes())
+					if err != nil {
+						srcFD.Close()
+						return err
+					}
 				} else {
 					log.Printf("%q: no change", srcPath)
-					sc.Add(srcPath, currentSig)
+					err = sc.Add(srcPath, currentSig.Bytes())
+					if err != nil {
+						srcFD.Close()
+						return err
+					}
 				}
 				srcFD.Close()
 				delete(pathsToCheck, srcPath)
@@ -245,7 +315,7 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 	// handle deleted files
 	for deletedFilePath := range pathsToCheck {
 		log.Printf("%q: deleted", deletedFilePath)
-		_, err = snap.Add(&Metadata{Path: deletedFilePath, Attribs: FileAttributes{}}, nil, 0)
+		err = snap.Add(&Metadata{Path: deletedFilePath, Attribs: FileAttributes{}}, nil, 0)
 		if err != nil {
 			snap.Close()
 			os.Remove(snap.Name())

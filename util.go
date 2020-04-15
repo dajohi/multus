@@ -5,7 +5,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/silvasur/golibrsync/librsync"
+	"github.com/smtc/rsync"
 )
 
 func isCharDevice(filemode os.FileMode) bool {
@@ -40,41 +40,22 @@ func minor(rdev uint64) uint64 {
 	return (rdev & 0xff) | ((rdev & 0xffff0000) >> 8)
 }
 
-var (
-	sigS = new(bytes.Buffer)
-)
-
-func init() {
-	sigS.Grow(1024 * 1024 * 10)
-}
-
-func signatureFromReader(fd io.ReadSeeker) (Signature, error) {
+func signatureFromReader(dstBuf *bytes.Buffer, fd io.ReadSeeker, len int64) error {
 	// Save the current offset
 	savedOffset, err := fd.Seek(0, 1)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// Create signature of the source file
-	sigS.Reset()
-	err = librsync.CreateSignature(fd, sigS)
+	err = rsync.GenSign(fd, len, 2048, dstBuf)
 	if err != nil {
-		return nil, err
-	}
-	buf := make([]byte, sigS.Len())
-	copy(buf, sigS.Bytes())
-
-	if sigS.Cap() > 1024*1024*10 {
-		sigS = new(bytes.Buffer)
-		sigS.Grow(1024 * 1024 * 10)
+		return err
 	}
 
 	// Return cursor to the original offset
 	_, err = fd.Seek(savedOffset, 0)
-	if err != nil {
-		return nil, err
-	}
-	return buf, nil
+	return err
 }
 
 func zero(b []byte) {

@@ -20,12 +20,12 @@ import (
 	"time"
 
 	"github.com/jrick/ss/stream"
-	"github.com/silvasur/golibrsync/librsync"
+	"github.com/smtc/rsync"
 	"golang.org/x/sync/errgroup"
 )
 
 func restore(ctx context.Context, secretKey *stream.SecretKey, sourceDir, destDir string, fileRegexp *regexp.Regexp, level int32) error {
-	insts, err := SnapshotList(secretKey, sourceDir)
+	insts, err := SnapshotList(ctx, secretKey, sourceDir)
 	if err != nil {
 		return err
 	}
@@ -299,7 +299,7 @@ func restore(ctx context.Context, secretKey *stream.SecretKey, sourceDir, destDi
 							return err
 						}
 						basis := bytes.NewReader([]byte(currentDelta))
-						if err = librsync.Patch(basis, reader, target); err != nil {
+						if err = rsync.Patch(reader, basis, target); err != nil {
 							dataFileGZ.Close()
 							pipeR.Close()
 							return err
@@ -311,7 +311,7 @@ func restore(ctx context.Context, secretKey *stream.SecretKey, sourceDir, destDi
 							pipeR.Close()
 							return err
 						}
-						if err = librsync.Patch(basis, reader, target); err != nil {
+						if err = rsync.Patch(reader, basis, target); err != nil {
 							basis.Close()
 							dataFileGZ.Close()
 							pipeR.Close()
@@ -393,7 +393,7 @@ func restore(ctx context.Context, secretKey *stream.SecretKey, sourceDir, destDi
 					}
 
 					reader := bytes.NewReader(buf.Bytes())
-					if err = librsync.Patch(basis, reader, tmpFile); err != nil {
+					if err = rsync.Patch(reader, basis, tmpFile); err != nil {
 						basis.Close()
 						dataFileGZ.Close()
 						pipeR.Close()

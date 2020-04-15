@@ -21,7 +21,7 @@ import (
 const FormatVersion = uint16(1)
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "backup\nrestore /RESTOREPATH [file] [level]")
+	fmt.Fprintln(os.Stderr, "backup\nrestore /RESTOREPATH [file] [level]\ncat <inc-file>")
 }
 
 func main() {
@@ -95,6 +95,36 @@ func main() {
 			os.Exit(1)
 		}
 		gErr = backup(ctx, pubKey, cfg)
+	case "cat":
+		if len(os.Args) < 3 {
+			usage()
+			os.Exit(1)
+		}
+		if len(cfg.Restore.SecretFile) == 0 {
+			fmt.Fprintln(os.Stderr, "secretfile not set")
+			os.Exit(1)
+		}
+
+		skBytes, err := ioutil.ReadFile(cfg.Restore.SecretFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "%q secret: ", cfg.Restore.SecretFile)
+		secret, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprint(os.Stderr, "\n")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		sk, _, err := keyfile.OpenSecretKey(bytes.NewReader(skBytes), secret)
+		zero(secret)
+		zero(skBytes)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		gErr = cat(ctx, sk, os.Args[2])
 	case "restore":
 		if len(os.Args) < 3 {
 			usage()
