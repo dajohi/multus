@@ -121,7 +121,7 @@ func cat(ctx context.Context, secretKey *stream.SecretKey, file string) error {
 		b.Reset()
 
 		if attrib.IsEmpty() {
-			fmt.Printf("%q: delete", path)
+			fmt.Printf("%q: delete\n", path)
 			continue
 		}
 
