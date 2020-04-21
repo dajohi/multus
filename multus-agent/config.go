@@ -22,6 +22,8 @@ type config struct {
 	BWLimit     string
 	MaxSize     int64
 	Login       string
+	Includes    []string
+	Excludes    []string
 	Hosts       []Host
 }
 
