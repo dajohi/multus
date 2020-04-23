@@ -25,8 +25,9 @@ func main() {
 	defer cancel()
 
 	defaultArgs := []string{
+		"--progress",
 		"--timeout",
-		"10",
+		fmt.Sprintf("%d", cfg.Timeout),
 		"--bwlimit",
 		cfg.BWLimit,
 		"-av",
@@ -70,10 +71,9 @@ func main() {
 		fmt.Printf("%s\n", cmd.String())
 		stdoutStderr, err := cmd.CombinedOutput()
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 			continue
 		}
-
 		fmt.Printf("%s\n\n", stdoutStderr)
 	}
 	cancel()

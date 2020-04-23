@@ -24,6 +24,7 @@ type config struct {
 	Login       string
 	Includes    []string
 	Excludes    []string
+	Timeout     uint
 	Hosts       []Host
 }
 
