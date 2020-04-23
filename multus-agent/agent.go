@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,7 +27,6 @@ func main() {
 	defer cancel()
 
 	defaultArgs := []string{
-		"--progress",
 		"--timeout",
 		fmt.Sprintf("%d", cfg.Timeout),
 		"--bwlimit",
@@ -68,13 +69,60 @@ func main() {
 		}...)
 
 		cmd := exec.CommandContext(ctx, "/usr/local/bin/rsync", args...)
-		fmt.Printf("%s\n", cmd.String())
-		stdoutStderr, err := cmd.CombinedOutput()
+		stdOutPipe, err := cmd.StdoutPipe()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			fmt.Fprintf(os.Stderr, "ERROR: StdoutPipe: %v\n", err)
 			continue
 		}
-		fmt.Printf("%s\n\n", stdoutStderr)
+		stdErrPipe, err := cmd.StderrPipe()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: StderrPipe: %v\n", err)
+			continue
+		}
+		fmt.Printf("%s\n", cmd.String())
+		err = cmd.Start()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: Start: %v\n", err)
+			return
+		}
+		go func() {
+			var buf [1024]byte
+			for {
+				n, err := stdOutPipe.Read(buf[:])
+				if n > 0 {
+					os.Stdout.Write(buf[0:n])
+					os.Stdout.Sync()
+				}
+				if errors.Is(err, os.ErrClosed) || errors.Is(err, io.EOF) {
+					return
+				}
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: stdout Read: %v\n", err)
+					return
+				}
+			}
+		}()
+		go func() {
+			var buf [1024]byte
+			for {
+				n, err := stdErrPipe.Read(buf[:])
+				if n > 0 {
+					os.Stderr.Write(buf[0:n])
+					os.Stderr.Sync()
+				}
+				if errors.Is(err, os.ErrClosed) || errors.Is(err, io.EOF) {
+					return
+				}
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: stderr Read: %v\n", err)
+					return
+				}
+			}
+		}()
+
+		if err = cmd.Wait(); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: Wait: %v\n", err)
+		}
 	}
 	cancel()
 
