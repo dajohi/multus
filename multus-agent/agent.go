@@ -124,9 +124,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "ERROR: Wait: %v\n", err)
 		}
 	}
-	cancel()
-
-	err = cleanup(cfg.StoragePath, cfg.MaxSize)
+	err = cleanup(ctx, cfg.StoragePath, cfg.MaxSize)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cleanup: %v\n", err)
 	}

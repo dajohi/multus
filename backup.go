@@ -34,11 +34,8 @@ func lookupGroup(groupName string) (int, error) {
 	return int(gid), nil
 }
 
-func removeOld(snapName string) {
-	log.Printf("snapName: %s", snapName)
-	baseDir := filepath.Dir(snapName)
-
-	files, err := ioutil.ReadDir(baseDir)
+func removeOld(destDir string) {
+	files, err := ioutil.ReadDir(destDir)
 	if err != nil {
 		panic(err)
 	}
@@ -46,10 +43,13 @@ func removeOld(snapName string) {
 		if !strings.HasSuffix(file.Name(), ".gz.enc") {
 			continue
 		}
-		if strings.HasPrefix(file.Name(), filepath.Base(snapName)[0:13]) {
+		filePath := filepath.Join(destDir, file.Name())
+		log.Printf("deleting %s", filePath)
+		err := os.Remove(filePath)
+		if err != nil {
+			log.Printf("ERROR: %v", err)
 			continue
 		}
-		log.Printf("possible delete: %s", file.Name())
 	}
 }
 
@@ -94,14 +94,16 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 
 	pathsToCheck := existingSC.Paths()
 
+	if sc.instance == 0 {
+		removeOld(destDir)
+	}
+
 	log.Printf("----------  RUNNING LEVEL %d (%v) -----------", sc.instance, sc.timeStamp)
 
 	snap, err := NewSnapshot(ctx, pubKey, uid, gid, cfg.Backup.GZLevel, destDir, sc.hostname, sc.timeStamp, sc.instance, sc.version)
 	if err != nil {
 		return err
 	}
-
-	removeOld(snap.Name())
 
 	readBuffer := new(bytes.Reader)
 	currentSig := new(bytes.Buffer)
