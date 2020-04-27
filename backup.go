@@ -34,7 +34,7 @@ func lookupGroup(groupName string) (int, error) {
 	return int(gid), nil
 }
 
-func removeOld(destDir string) {
+func removeOld(destDir string, dryRun bool) {
 	files, err := ioutil.ReadDir(destDir)
 	if err != nil {
 		panic(err)
@@ -44,11 +44,15 @@ func removeOld(destDir string) {
 			continue
 		}
 		filePath := filepath.Join(destDir, file.Name())
-		log.Printf("deleting %s", filePath)
-		err := os.Remove(filePath)
-		if err != nil {
-			log.Printf("ERROR: %v", err)
-			continue
+		if dryRun {
+			log.Printf("deleting %s (dryrun)", filePath)
+		} else {
+			log.Printf("deleting %s", filePath)
+			err := os.Remove(filePath)
+			if err != nil {
+				log.Printf("ERROR: %v", err)
+				continue
+			}
 		}
 	}
 }
@@ -95,7 +99,7 @@ func backup(ctx context.Context, pubKey *stream.PublicKey, cfg *config) error {
 	pathsToCheck := existingSC.Paths()
 
 	if sc.instance == 0 {
-		removeOld(destDir)
+		removeOld(destDir, cfg.DryRun)
 	}
 
 	log.Printf("----------  RUNNING LEVEL %d (%v) -----------", sc.instance, sc.timeStamp)

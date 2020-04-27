@@ -18,6 +18,7 @@ type Host struct {
 }
 
 type config struct {
+	DryRun      bool
 	StoragePath string
 	BWLimit     string
 	MaxSize     int64

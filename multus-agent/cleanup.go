@@ -67,7 +67,7 @@ func genTimestamp(name string) (time.Time, error) {
 	return time.Date(int(year), time.Month(month), int(day), int(hour), int(min), 0, 0, time.Local), nil
 }
 
-func cleanup(ctx context.Context, storagePath string, maxSize int64) error {
+func cleanup(ctx context.Context, storagePath string, maxSize int64, dryRun bool) error {
 	var totalSize int64
 	var files Files
 	err := filepath.Walk(storagePath, func(srcPath string, info os.FileInfo, err error) error {
@@ -138,10 +138,14 @@ func cleanup(ctx context.Context, storagePath string, maxSize int64) error {
 			}
 			curTime = file.Timestamp
 		}
-		log.Printf("deleting %q (%d)", file.Path, file.Size)
-		if err = os.Remove(file.Path); err != nil {
-			log.Printf("ERROR: Remove: %s: %v", file.Path, err)
-			continue
+		if dryRun {
+			log.Printf("deleting %q (%d) (dryrun)", file.Path, file.Size)
+		} else {
+			log.Printf("deleting %q (%d)", file.Path, file.Size)
+			if err = os.Remove(file.Path); err != nil {
+				log.Printf("ERROR: Remove: %s: %v", file.Path, err)
+				continue
+			}
 		}
 		totalSize -= file.Size
 		deletedSize += file.Size

@@ -29,6 +29,7 @@ type RestoreConfig struct {
 }
 
 type config struct {
+	DryRun     bool
 	Profile    bool
 	BackupPath string
 	Backup     BackupConfig
